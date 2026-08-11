@@ -2,71 +2,73 @@
 Phase: OCR Bill Scanner.
 
 Flow:
-user uploads a photo of a receipt
--> Tesseract extracts raw text
--> regex parsing pulls out total amount / merchant name / date
--> category is guessed using keyword matching
--> parsed draft is returned to the frontend
--> user reviews/edits it
--> user confirms
--> normal POST /transactions/ saves it.
+User uploads a receipt -> Tesseract OCR extracts text ->
+amount / merchant / date are parsed -> category is suggested ->
+frontend shows the parsed draft -> user reviews and confirms ->
+normal transaction endpoint saves it.
 
-OCR does NOT automatically create a transaction.
-The user must confirm the extracted information first.
-
-The OCR scan is also logged in receipt_scans for the audit trail.
+The OCR result is NOT automatically saved as a transaction.
 """
 
 import io
 import os
 import re
+import shutil
 from datetime import date
 from typing import Optional
 
 import pytesseract
 from PIL import Image, ImageOps, ImageFilter
-
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 
 import models
 import schemas
-
 from database import get_db
 from auth import get_current_user
-
-
-# ============================================================
-# TESSERACT CONFIGURATION
-# ============================================================
-#
-# Windows:
-#   C:\Program Files\Tesseract-OCR\tesseract.exe
-#
-# Render / Docker / Linux:
-#   /usr/bin/tesseract
-#
-# This automatically selects the correct executable depending
-# on the operating system.
-# ============================================================
-
-if os.name == "nt":
-    windows_tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-
-    if os.path.exists(windows_tesseract):
-        pytesseract.pytesseract.tesseract_cmd = windows_tesseract
-else:
-    linux_tesseract = "/usr/bin/tesseract"
-
-    if os.path.exists(linux_tesseract):
-        pytesseract.pytesseract.tesseract_cmd = linux_tesseract
 
 
 router = APIRouter(prefix="/ocr", tags=["ocr"])
 
 
 # ============================================================
-# CONFIGURATION
+# TESSERACT CONFIGURATION
+# ============================================================
+
+def _configure_tesseract():
+    """
+    Works both locally on Windows and inside Render's Linux Docker container.
+
+    Windows:
+        C:\\Program Files\\Tesseract-OCR\\tesseract.exe
+
+    Linux / Render:
+        /usr/bin/tesseract
+    """
+
+    # First try PATH.
+    tesseract_path = shutil.which("tesseract")
+
+    if tesseract_path:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_path
+        return
+
+    # Windows fallback.
+    windows_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+    if os.path.exists(windows_path):
+        pytesseract.pytesseract.tesseract_cmd = windows_path
+        return
+
+    # If neither exists, OCR will produce a clear error later.
+    pytesseract.pytesseract.tesseract_cmd = "tesseract"
+
+
+_configure_tesseract()
+
+
+# ============================================================
+# CONFIG
 # ============================================================
 
 MAX_FILE_SIZE_MB = 8
@@ -174,15 +176,8 @@ CATEGORY_KEYWORDS = {
 
 
 # ============================================================
-# REGEX PATTERNS
+# REGEX
 # ============================================================
-
-# Examples:
-# 1234.56
-# 1,234.56
-# Rs. 1234
-# $12.34
-# INR 500
 
 _AMOUNT_RE = re.compile(
     r"(?:rs\.?|inr|\$|usd)?\s*"
@@ -190,13 +185,11 @@ _AMOUNT_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 _TOTAL_LINE_RE = re.compile(
     r"(grand\s*total|total\s*amount|total|amount\s*due|"
-    r"balance\s*due|net\s*payable)",
+    r"balance\s*due|net\s*payable|amount\s*paid)",
     re.IGNORECASE,
 )
-
 
 _DATE_PATTERNS = [
     (
@@ -220,17 +213,20 @@ _DATE_PATTERNS = [
 
 def _preprocess(image_bytes: bytes) -> Image.Image:
     """
-    Improve receipt image quality before sending it to Tesseract.
+    Basic preprocessing to improve Tesseract OCR accuracy.
 
     Steps:
-    1. Open image
-    2. Convert to grayscale
-    3. Increase contrast
-    4. Sharpen
-    5. Upscale small images
+    - Open image
+    - Convert to grayscale
+    - Increase contrast
+    - Sharpen
+    - Upscale small images
     """
 
-    img = Image.open(io.BytesIO(image_bytes))
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+    except Exception as exc:
+        raise ValueError(f"Invalid image file: {exc}")
 
     img = img.convert("L")
 
@@ -238,15 +234,13 @@ def _preprocess(image_bytes: bytes) -> Image.Image:
 
     img = img.filter(ImageFilter.SHARPEN)
 
-    if img.width < 1000:
-        scale = 1000 / img.width
+    if img.width < 1200:
+        scale = 1200 / img.width
 
-        img = img.resize(
-            (
-                int(img.width * scale),
-                int(img.height * scale),
-            )
-        )
+        new_width = int(img.width * scale)
+        new_height = int(img.height * scale)
+
+        img = img.resize((new_width, new_height))
 
     return img
 
@@ -257,10 +251,10 @@ def _preprocess(image_bytes: bytes) -> Image.Image:
 
 def _extract_amount(text: str) -> Optional[float]:
     """
-    Prefer amounts found on TOTAL / AMOUNT DUE lines.
+    Prefer amounts appearing on TOTAL / AMOUNT DUE lines.
 
-    If no total line is detected, use the largest plausible
-    currency value found on the receipt.
+    If no total line exists, use the largest plausible amount
+    found in the receipt.
     """
 
     lines = text.splitlines()
@@ -269,20 +263,20 @@ def _extract_amount(text: str) -> Optional[float]:
     all_candidates = []
 
     for line in lines:
-
         matches = _AMOUNT_RE.findall(line)
 
         for match in matches:
-
             cleaned = match.replace(",", "")
 
             try:
                 value = float(cleaned)
-
             except ValueError:
                 continue
 
-            if value <= 0 or value > 10_000_000:
+            if value <= 0:
+                continue
+
+            if value > 10_000_000:
                 continue
 
             all_candidates.append(value)
@@ -304,6 +298,15 @@ def _extract_amount(text: str) -> Optional[float]:
 # ============================================================
 
 def _extract_date(text: str) -> Optional[date]:
+    """
+    Extract receipt date.
+
+    Supports:
+        DD/MM/YYYY
+        DD-MM-YYYY
+        DD.MM.YYYY
+        YYYY-MM-DD
+    """
 
     today = date.today()
 
@@ -317,11 +320,9 @@ def _extract_date(text: str) -> Optional[date]:
         try:
 
             if order == "dmy":
-
                 d, mo, y = match.groups()
 
             else:
-
                 y, mo, d = match.groups()
 
             y = int(y)
@@ -335,6 +336,8 @@ def _extract_date(text: str) -> Optional[date]:
                 int(d),
             )
 
+            # Do not accept dates before 2000
+            # or dates in the future.
             if candidate.year >= 2000 and candidate <= today:
                 return candidate
 
@@ -350,19 +353,40 @@ def _extract_date(text: str) -> Optional[date]:
 
 def _extract_merchant(text: str) -> Optional[str]:
     """
-    Try to identify the merchant name from the first few
-    non-empty OCR lines.
+    Approximate merchant name from the first few meaningful lines.
     """
 
-    for line in text.splitlines()[:8]:
+    lines = text.splitlines()
+
+    checked_lines = 0
+
+    for line in lines:
 
         cleaned = line.strip()
 
-        if (
-            2 <= len(cleaned) <= 40
-            and sum(c.isalpha() for c in cleaned)
-            >= max(2, len(cleaned) // 2)
-        ):
+        if not cleaned:
+            continue
+
+        checked_lines += 1
+
+        if checked_lines > 10:
+            break
+
+        # Ignore lines that are obviously numbers.
+        if not any(c.isalpha() for c in cleaned):
+            continue
+
+        # Avoid extremely long OCR paragraphs.
+        if len(cleaned) > 60:
+            continue
+
+        alpha_count = sum(
+            c.isalpha()
+            for c in cleaned
+        )
+
+        if alpha_count >= max(2, len(cleaned) // 2):
+
             return cleaned
 
     return None
@@ -378,45 +402,55 @@ def _suggest_category(
     raw_text: str,
 ):
     """
-    Guess a category using merchant name and OCR text.
+    Suggest a category using merchant + OCR text.
 
-    The category is then looked up in the actual database,
-    so the ID comes from the current category table.
+    Category names are looked up from the database, so the
+    actual category IDs remain database-controlled.
     """
 
-    haystack = f"{merchant or ''} {raw_text}".lower()
+    haystack = (
+        f"{merchant or ''} {raw_text}"
+    ).lower()
 
     for category_name, keywords in CATEGORY_KEYWORDS.items():
 
-        if any(keyword in haystack for keyword in keywords):
+        for keyword in keywords:
 
-            category = (
-                db.query(models.Category)
-                .filter(models.Category.name == category_name)
-                .first()
-            )
+            if keyword.lower() in haystack:
 
-            if category:
-                return category
+                category = (
+                    db.query(models.Category)
+                    .filter(
+                        models.Category.name == category_name
+                    )
+                    .first()
+                )
 
-    # Fallback:
-    # Prefer Shopping if it exists.
-    # Otherwise use the first non-income category.
+                if category:
+                    return category
 
+    # Default fallback.
+    shopping = (
+        db.query(models.Category)
+        .filter(
+            models.Category.name == "Shopping"
+        )
+        .first()
+    )
+
+    if shopping:
+        return shopping
+
+    # Last fallback: first non-income category.
     fallback = (
         db.query(models.Category)
-        .filter(models.Category.name == "Shopping")
+        .filter(
+            models.Category.is_income.is_(False)
+        )
         .first()
     )
 
-    if fallback:
-        return fallback
-
-    return (
-        db.query(models.Category)
-        .filter(models.Category.is_income == False)
-        .first()
-    )
+    return fallback
 
 
 # ============================================================
@@ -448,7 +482,7 @@ async def scan_receipt(
         )
 
     # --------------------------------------------------------
-    # Read uploaded file
+    # Read file
     # --------------------------------------------------------
 
     raw_bytes = await file.read()
@@ -462,9 +496,16 @@ async def scan_receipt(
         raise HTTPException(
             status_code=400,
             detail=(
-                f"File too large "
-                f"(max {MAX_FILE_SIZE_MB}MB)."
+                f"File too large. Maximum size is "
+                f"{MAX_FILE_SIZE_MB}MB."
             ),
+        )
+
+    if not raw_bytes:
+
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded image is empty.",
         )
 
     # --------------------------------------------------------
@@ -475,17 +516,53 @@ async def scan_receipt(
 
         image = _preprocess(raw_bytes)
 
-        raw_text = pytesseract.image_to_string(image)
+        raw_text = pytesseract.image_to_string(
+            image,
+            config="--psm 6",
+        )
 
     except Exception as exc:
 
+        error_text = str(exc)
+
+        # Give a cleaner deployment-specific error.
+        if (
+            "tesseract" in error_text.lower()
+            or "not found" in error_text.lower()
+        ):
+
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Tesseract OCR is not available on "
+                    "the backend server."
+                ),
+            )
+
         raise HTTPException(
             status_code=422,
-            detail=f"Could not read this image: {exc}",
+            detail=(
+                "Could not read this image. "
+                "Please try a clearer receipt photo."
+            ),
         )
 
     # --------------------------------------------------------
-    # Extract information
+    # Check OCR result
+    # --------------------------------------------------------
+
+    if not raw_text.strip():
+
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Could not read that receipt. "
+                "Try a clearer photo."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Parse receipt
     # --------------------------------------------------------
 
     amount = _extract_amount(raw_text)
@@ -504,7 +581,7 @@ async def scan_receipt(
     )
 
     # --------------------------------------------------------
-    # Confidence score
+    # Confidence
     # --------------------------------------------------------
 
     found = sum(
@@ -516,7 +593,12 @@ async def scan_receipt(
 
         confidence = round(
             (found / 2)
-            * (0.9 if amount and merchant else 0.5),
+            * (
+                0.9
+                if amount is not None
+                and merchant is not None
+                else 0.5
+            ),
             2,
         )
 
@@ -525,7 +607,7 @@ async def scan_receipt(
         confidence = 0.0
 
     # --------------------------------------------------------
-    # Save scan to database
+    # Save OCR audit record
     # --------------------------------------------------------
 
     scan = models.ReceiptScan(
@@ -536,7 +618,9 @@ async def scan_receipt(
         parsed_merchant=merchant,
         parsed_date=parsed_date,
         suggested_category_id=(
-            category.id if category else None
+            category.id
+            if category
+            else None
         ),
         confidence=confidence,
     )
@@ -548,7 +632,7 @@ async def scan_receipt(
     db.refresh(scan)
 
     # --------------------------------------------------------
-    # Return parsed receipt to frontend
+    # Return parsed draft
     # --------------------------------------------------------
 
     return schemas.ReceiptScanOut(
@@ -558,17 +642,21 @@ async def scan_receipt(
         parsed_merchant=merchant,
         parsed_date=parsed_date,
         suggested_category_id=(
-            category.id if category else None
+            category.id
+            if category
+            else None
         ),
         suggested_category_name=(
-            category.name if category else None
+            category.name
+            if category
+            else None
         ),
         confidence=confidence,
     )
 
 
 # ============================================================
-# LINK SCAN TO TRANSACTION
+# LINK OCR SCAN TO TRANSACTION
 # ============================================================
 
 @router.post(
@@ -580,12 +668,6 @@ def link_scan_to_transaction(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """
-    Called after the frontend saves the confirmed
-    transaction.
-
-    This connects the OCR scan to the resulting transaction.
-    """
 
     scan = (
         db.query(models.ReceiptScan)
@@ -600,10 +682,10 @@ def link_scan_to_transaction(
 
         raise HTTPException(
             status_code=404,
-            detail="Scan not found",
+            detail="Scan not found.",
         )
 
-    txn = (
+    transaction = (
         db.query(models.Transaction)
         .filter(
             models.Transaction.id == transaction_id,
@@ -612,14 +694,14 @@ def link_scan_to_transaction(
         .first()
     )
 
-    if not txn:
+    if not transaction:
 
         raise HTTPException(
             status_code=404,
-            detail="Transaction not found",
+            detail="Transaction not found.",
         )
 
-    scan.resulting_transaction_id = txn.id
+    scan.resulting_transaction_id = transaction.id
 
     db.commit()
 
