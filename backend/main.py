@@ -24,6 +24,26 @@ logger = logging.getLogger("finguard")
 # Creates tables from models.py if they don't exist yet.
 # (You can also just run database/schema.sql directly against SQLite/MySQL/Postgres.)
 Base.metadata.create_all(bind=engine)
+# Seed default categories if none exist
+from database import SessionLocal
+from models import Category
+
+db = SessionLocal()
+if db.query(Category).count() == 0:
+    db.add_all([
+        Category(name="Groceries", icon="🛒", is_income=False),
+        Category(name="Rent", icon="🏠", is_income=False),
+        Category(name="Transport", icon="🚗", is_income=False),
+        Category(name="Entertainment", icon="🎬", is_income=False),
+        Category(name="Utilities", icon="💡", is_income=False),
+        Category(name="Dining Out", icon="🍔", is_income=False),
+        Category(name="Healthcare", icon="🏥", is_income=False),
+        Category(name="Shopping", icon="🛍️", is_income=False),
+        Category(name="Salary", icon="💰", is_income=True),
+        Category(name="Other", icon="📦", is_income=False),
+    ])
+    db.commit()
+db.close()
 
 ENV = os.getenv("ENV", "development")
 
