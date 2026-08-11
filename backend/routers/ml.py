@@ -15,7 +15,7 @@ router = APIRouter(prefix="/insights", tags=["insights"])
 def get_forecast(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     rows = (
         db.query(
-            func.strftime("%Y-%m", models.Transaction.txn_date).label("month"),
+           func.to_char(models.Transaction.txn_date, "YYYY-MM").label("month"),
             func.sum(models.Transaction.amount).label("total"),
         )
         .filter(models.Transaction.user_id == current_user.id)
