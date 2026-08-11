@@ -1,0 +1,59 @@
+# One-command local/demo deployment: `docker compose up --build`
+# Backend -> http://localhost:8000  (Swagger docs at /docs)
+# Frontend -> http://localhost:5173
+#
+# Defaults to SQLite (zero config, file persisted via a volume) so this works
+# immediately for a viva/demo. To run against Postgres instead, uncomment the
+# `postgres` service and the `DATABASE_URL` override on `backend`.
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      ENV: production
+      JWT_SECRET: ${JWT_SECRET:-demo-only-change-me-for-real-deployments}
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+      DATABASE_URL: sqlite:///./data/finguard.db
+      # DATABASE_URL: postgresql://finguard:finguard@postgres:5432/finguard   # <- Postgres option
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEFAULT_RATE_LIMIT: 100/minute
+    volumes:
+      - backend_data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # depends_on: [postgres]   # <- uncomment if using the Postgres service below
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: http://localhost:8000
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+  # --- Optional: Postgres instead of SQLite (recommended before connecting Power BI) ---
+  # postgres:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_USER: finguard
+  #     POSTGRES_PASSWORD: finguard
+  #     POSTGRES_DB: finguard
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - pg_data:/var/lib/postgresql/data
+
+volumes:
+  backend_data:
+  # pg_data:

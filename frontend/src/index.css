@@ -1,0 +1,13 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  font-family: 'Manrope', sans-serif;
+  color: #211B26;
+}
+
+.font-nums {
+  font-variant-numeric: tabular-nums;
+  font-family: 'Space Mono', monospace;
+}

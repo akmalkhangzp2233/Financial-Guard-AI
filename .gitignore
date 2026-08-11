@@ -1,0 +1,31 @@
+# --- Python / backend ---
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+backend/.env
+backend/finguard.db
+backend/data/
+
+# --- Node / frontend ---
+node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+npm-debug.log*
+
+# --- ML ---
+ml/data/*.csv
+!ml/data/.gitkeep
+
+# --- OS / editor ---
+.DS_Store
+.vscode/
+.idea/
+*.log
+
+# --- Docs build artifacts ---
+docs/**/*.pdf
+!docs/diagrams/*.pdf

@@ -1,0 +1,31 @@
+# Render Blueprint — deploy the backend with one click via "New +" -> "Blueprint"
+# and pointing Render at this repo. Frontend is deployed separately on
+# Vercel/Netlify (see DEPLOYMENT.md) since Render's free tier is best suited
+# to the API + DB half of this stack.
+services:
+  - type: web
+    name: finguard-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CORS_ORIGINS
+        value: https://your-frontend.vercel.app
+      - key: DATABASE_URL
+        fromDatabase:
+          name: finguard-db
+          property: connectionString
+      - key: OPENAI_API_KEY
+        sync: false   # set manually in the Render dashboard — never commit real keys
+
+databases:
+  - name: finguard-db
+    plan: free
+    databaseName: finguard
+    user: finguard
