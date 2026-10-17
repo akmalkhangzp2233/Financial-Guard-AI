@@ -110,10 +110,32 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    logger.info(f"Validation error on {request.url.path}: {exc.errors()}")
+    # Exclude raw input values to prevent bytes serialization errors
+    # and avoid exposing passwords or other sensitive request data.
+    safe_errors = [
+        {
+            "type": error.get("type"),
+            "loc": list(error.get("loc", ())),
+            "msg": error.get("msg", "Invalid request"),
+        }
+        for error in exc.errors()
+    ]
+
+    logger.info(
+        "Validation error on %s: %s",
+        request.url.path,
+        safe_errors,
+    )
+
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"error": {"code": 422, "message": "Validation failed", "details": exc.errors()}},
+        content={
+            "error": {
+                "code": status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "message": "Validation failed",
+                "details": safe_errors,
+            }
+        },
     )
 
 
